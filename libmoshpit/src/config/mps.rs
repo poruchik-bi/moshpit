@@ -63,9 +63,8 @@ mod tests {
     use super::Mps;
 
     fn mps(min: u16, max: u16) -> Mps {
-        let toml = format!(
-            "ip = \"0.0.0.0\"\nport = 40404\nudp_port_min = {min}\nudp_port_max = {max}\n"
-        );
+        let toml =
+            format!("ip = \"0.0.0.0\"\nport = 40404\nudp_port_min = {min}\nudp_port_max = {max}\n");
         toml::from_str(&toml).expect("valid mps config")
     }
 

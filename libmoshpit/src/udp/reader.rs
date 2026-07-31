@@ -889,65 +889,77 @@ impl UdpReader {
         // address after a NAT rebind are not silently dropped by the OS.
         let mut current_peer: SocketAddr = {
             let mut buf = vec![0u8; 65535];
-            let (first_len, peer_addr) = self.socket.recv_from(&mut buf).await?;
-            if let Some(tx) = self.peer_discovered_tx.take() {
-                let _ = tx.send(peer_addr);
-            }
-            // Process the first packet through the normal pipeline.
-            let mut first_buf = BytesMut::from(&buf[..first_len]);
-            match self.parse_encrypted_frame(&mut first_buf) {
-                Ok(Some((frame, seq))) => {
-                    if let Some(ref counter) = self.last_rx_us {
-                        counter.store(now_micros(), Ordering::Relaxed);
-                    }
-                    for ready in self.handle_arrival(frame, seq) {
-                        match ready {
-                            EncryptedFrame::Bytes((_id, message)) => {
-                                term_tx.send(TerminalMessage::Input(message)).await?;
-                            }
-                            EncryptedFrame::Resize((_id, columns, rows)) => {
-                                term_tx
-                                    .send(TerminalMessage::Resize { rows, columns })
-                                    .await?;
-                            }
-                            EncryptedFrame::RepaintRequest => {
-                                if let Some(ref tx) = self.repaint_tx
-                                    && let Err(e) = tx.try_send(())
-                                {
-                                    warn!("Failed to signal repaint request: {e}");
+            // Keep reading until a datagram *authenticates*. The peer address
+            // decides where this session's output is sent, so it must never be
+            // taken from an unauthenticated packet: anyone who can reach the UDP
+            // port could otherwise claim a freshly bound session by racing the
+            // real client, and the server would send its output to them.
+            // Unauthenticated datagrams are discarded without touching state.
+            let peer_addr = loop {
+                let (first_len, peer_addr) = self.socket.recv_from(&mut buf).await?;
+                // Process the first packet through the normal pipeline.
+                let mut first_buf = BytesMut::from(&buf[..first_len]);
+                match self.parse_encrypted_frame(&mut first_buf) {
+                    Ok(Some((frame, seq))) => {
+                        if let Some(tx) = self.peer_discovered_tx.take() {
+                            let _ = tx.send(peer_addr);
+                        }
+                        if let Some(ref counter) = self.last_rx_us {
+                            counter.store(now_micros(), Ordering::Relaxed);
+                        }
+                        for ready in self.handle_arrival(frame, seq) {
+                            match ready {
+                                EncryptedFrame::Bytes((_id, message)) => {
+                                    term_tx.send(TerminalMessage::Input(message)).await?;
                                 }
-                            }
-                            EncryptedFrame::Keepalive(ts) => {
-                                let rtt_us = now_micros().saturating_sub(ts);
-                                if rtt_us > 0 && rtt_us < 30_000_000 {
-                                    self.update_rtt_estimate(Duration::from_micros(rtt_us));
+                                EncryptedFrame::Resize((_id, columns, rows)) => {
+                                    term_tx
+                                        .send(TerminalMessage::Resize { rows, columns })
+                                        .await?;
                                 }
-                            }
-                            EncryptedFrame::Nak(_)
-                            | EncryptedFrame::Shutdown
-                            | EncryptedFrame::ScrollbackStart
-                            | EncryptedFrame::ScrollbackEnd
-                            | EncryptedFrame::ScreenState(_)
-                            | EncryptedFrame::ScreenStateCompressed(_)
-                            | EncryptedFrame::CompressedBytes(_)
-                            | EncryptedFrame::StateSyncDiff(_)
-                            | EncryptedFrame::PtyExit
-                            | EncryptedFrame::StateChunk(_) => {}
-                            EncryptedFrame::ClientAck(diff_id) => {
-                                if let Some(ref tx) = self.client_ack_tx
-                                    && let Err(e) = tx.try_send(diff_id)
-                                {
-                                    warn!("Failed to forward ClientAck: {e}");
+                                EncryptedFrame::RepaintRequest => {
+                                    if let Some(ref tx) = self.repaint_tx
+                                        && let Err(e) = tx.try_send(())
+                                    {
+                                        warn!("Failed to signal repaint request: {e}");
+                                    }
+                                }
+                                EncryptedFrame::Keepalive(ts) => {
+                                    let rtt_us = now_micros().saturating_sub(ts);
+                                    if rtt_us > 0 && rtt_us < 30_000_000 {
+                                        self.update_rtt_estimate(Duration::from_micros(rtt_us));
+                                    }
+                                }
+                                EncryptedFrame::Nak(_)
+                                | EncryptedFrame::Shutdown
+                                | EncryptedFrame::ScrollbackStart
+                                | EncryptedFrame::ScrollbackEnd
+                                | EncryptedFrame::ScreenState(_)
+                                | EncryptedFrame::ScreenStateCompressed(_)
+                                | EncryptedFrame::CompressedBytes(_)
+                                | EncryptedFrame::StateSyncDiff(_)
+                                | EncryptedFrame::PtyExit
+                                | EncryptedFrame::StateChunk(_) => {}
+                                EncryptedFrame::ClientAck(diff_id) => {
+                                    if let Some(ref tx) = self.client_ack_tx
+                                        && let Err(e) = tx.try_send(diff_id)
+                                    {
+                                        warn!("Failed to forward ClientAck: {e}");
+                                    }
                                 }
                             }
                         }
                     }
+                    // Truncated or unauthenticated: discard and keep waiting for
+                    // the real client rather than adopting the sender's address.
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!("Discarding unauthenticated first UDP frame: {e}");
+                        continue;
+                    }
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!("Failed to parse first UDP frame from client: {e}");
-                }
-            }
+                break peer_addr;
+            };
             peer_addr
         };
 
@@ -1007,7 +1019,13 @@ impl UdpReader {
                             if let Some(ref counter) = self.last_rx_us {
                                 counter.store(now_micros(), Ordering::Relaxed);
                             }
-                            if src_addr != current_peer {
+                            // Only a *fresh* packet may move the session. This is
+                            // the same rule handle_arrival applies below (seq <
+                            // next_seq is a replay), but it has to be checked here
+                            // too: without it, replaying one captured datagram from
+                            // another address redirects the session's output, even
+                            // though the frame itself is then discarded as a replay.
+                            if src_addr != current_peer && seq >= self.next_seq {
                                 info!("NAT roam: peer {} → {}", current_peer, src_addr);
                                 current_peer = src_addr;
                                 if let Some(ref tx) = self.peer_addr_tx
@@ -1929,6 +1947,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
+    use super::now_micros;
     use super::{
         ClientRenderCtx, DiffMode, EncryptedFrame, MAX_NAK_RETRIES, MAX_NAK_TIMEOUT, MAX_SEQ_JUMP,
         MIN_NAK_CHECK_INTERVAL, MIN_NAK_TIMEOUT, RECV_BUFFER_REPAINT_THRESHOLD,
@@ -1988,6 +2007,170 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use proptest::{prop_assert, prop_assert_eq, proptest};
+
+    // --- peer address is only ever taken from authenticated packets ----------
+    //
+    // The peer address decides where a session's output is sent, so anything that
+    // can move it is a hijack primitive. Both of these were live: the address was
+    // adopted from the first datagram to arrive whether or not it authenticated,
+    // and a replayed datagram moved it before handle_arrival rejected the replay.
+
+    /// Build a wire packet the reader will accept, with the given keys and seq.
+    fn wire_packet(
+        frame: &EncryptedFrame,
+        seq: u64,
+        id: Uuid,
+        rnk: &LessSafeKey,
+        hmac: &Key,
+    ) -> Vec<u8> {
+        use aws_lc_rs::aead::{Aad, NONCE_LEN, Nonce};
+        use aws_lc_rs::{hmac::sign, rand};
+        use bincode_next::{config::standard, encode_to_vec};
+
+        let data = encode_to_vec(frame, standard()).expect("encode frame");
+        let aad = Aad::from(seq.to_be_bytes());
+        let mut encrypted_part = id.as_bytes().to_vec();
+        encrypted_part.extend_from_slice(&data);
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::fill(&mut nonce_bytes).expect("nonce");
+        let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).expect("nonce");
+        rnk.seal_in_place_append_tag(nonce, aad, &mut encrypted_part)
+            .expect("seal");
+        let seq_bytes = seq.to_be_bytes();
+        let mut to_sign = seq_bytes.to_vec();
+        to_sign.extend_from_slice(&encrypted_part);
+        let tag = sign(hmac, &to_sign);
+        let mut packet = nonce_bytes.to_vec();
+        packet.extend_from_slice(&seq_bytes);
+        packet.extend_from_slice(tag.as_ref());
+        packet.extend_from_slice(&encrypted_part.len().to_be_bytes());
+        packet.extend_from_slice(&encrypted_part);
+        packet
+    }
+
+    /// An unauthenticated datagram must not become the session's peer address.
+    ///
+    /// Without this, anyone able to reach the UDP port can claim a freshly bound
+    /// session by racing the real client with a garbage packet, and the server
+    /// sends that session's output to them. No on-path position is needed — the
+    /// port pool is small enough to spray.
+    #[tokio::test]
+    async fn garbage_first_datagram_does_not_claim_the_session() -> Result<()> {
+        let id = Uuid::new_v4();
+        let rnk = LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[7u8; 32])?);
+        let hmac = Key::new(HMAC_SHA512, &[9u8; 64]);
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let server_addr = server_sock.local_addr()?;
+
+        let (peer_tx, peer_rx) = tokio::sync::oneshot::channel();
+        let (term_tx, _term_rx) = channel::<TerminalMessage>(16);
+        let mut reader = UdpReader::builder()
+            .socket(Arc::clone(&server_sock))
+            .id(id)
+            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[7u8; 32])?))
+            .hmac(Key::new(HMAC_SHA512, &[9u8; 64]))
+            .peer_discovered_tx(peer_tx)
+            .build();
+
+        let token = CancellationToken::new();
+        let loop_token = token.clone();
+        let handle = spawn(async move { reader.server_frame_loop(loop_token, term_tx).await });
+
+        // The attacker gets there first with something that cannot authenticate.
+        let attacker = UdpSocket::bind("127.0.0.1:0").await?;
+        let attacker_addr = attacker.local_addr()?;
+        let _sent = attacker.send_to(&[0xAB; 200], server_addr).await?;
+        sleep(Duration::from_millis(150)).await;
+
+        // Then the real client, with a packet that does.
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        let client_addr = client.local_addr()?;
+        let packet = wire_packet(&EncryptedFrame::Keepalive(now_micros()), 0, id, &rnk, &hmac);
+        let _sent = client.send_to(&packet, server_addr).await?;
+
+        let discovered = tokio::time::timeout(Duration::from_secs(5), peer_rx)
+            .await
+            .expect("peer address was never discovered")
+            .expect("peer channel dropped");
+        assert_ne!(discovered, attacker_addr, "an unauthenticated datagram claimed the session");
+        assert_eq!(discovered, client_addr, "the authenticated client should own the session");
+
+        token.cancel();
+        drop(handle.await);
+        Ok(())
+    }
+
+    /// A replayed datagram must not move the session's peer address.
+    ///
+    /// handle_arrival rejects `seq < next_seq` as a replay, but the roam used to
+    /// be applied before that check ran — so replaying one captured packet from
+    /// another address redirected the session's output even though the frame
+    /// itself was then discarded.
+    #[tokio::test]
+    async fn replayed_datagram_does_not_move_the_session() -> Result<()> {
+        let id = Uuid::new_v4();
+        let rnk = LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[3u8; 32])?);
+        let hmac = Key::new(HMAC_SHA512, &[5u8; 64]);
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let server_addr = server_sock.local_addr()?;
+
+        let (peer_tx, peer_rx) = tokio::sync::oneshot::channel();
+        let (roam_tx, mut roam_rx) = channel::<std::net::SocketAddr>(4);
+        let (term_tx, _term_rx) = channel::<TerminalMessage>(16);
+        let mut reader = UdpReader::builder()
+            .socket(Arc::clone(&server_sock))
+            .id(id)
+            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[3u8; 32])?))
+            .hmac(Key::new(HMAC_SHA512, &[5u8; 64]))
+            .peer_discovered_tx(peer_tx)
+            .peer_addr_tx(roam_tx)
+            .build();
+
+        let token = CancellationToken::new();
+        let loop_token = token.clone();
+        let handle = spawn(async move { reader.server_frame_loop(loop_token, term_tx).await });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        let first = wire_packet(&EncryptedFrame::Keepalive(now_micros()), 0, id, &rnk, &hmac);
+        let _sent = client.send_to(&first, server_addr).await?;
+        let _discovered = tokio::time::timeout(Duration::from_secs(5), peer_rx)
+            .await
+            .expect("peer never discovered")
+            .expect("peer channel dropped");
+
+        // Advance the session so seq 0 and 1 are firmly in the past.
+        let second = wire_packet(&EncryptedFrame::Keepalive(now_micros()), 1, id, &rnk, &hmac);
+        let _sent = client.send_to(&second, server_addr).await?;
+        sleep(Duration::from_millis(150)).await;
+
+        // The attacker replays a genuine, captured packet verbatim. It
+        // authenticates — that is the point — but it is stale.
+        let attacker = UdpSocket::bind("127.0.0.1:0").await?;
+        let _sent = attacker.send_to(&first, server_addr).await?;
+        sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            roam_rx.try_recv().is_err(),
+            "a replayed packet moved the session to the attacker's address"
+        );
+
+        // A genuinely fresh packet from a new address must still roam, or mobile
+        // roaming — the entire reason for this transport — stops working.
+        let roamed = UdpSocket::bind("127.0.0.1:0").await?;
+        let roamed_addr = roamed.local_addr()?;
+        let fresh = wire_packet(&EncryptedFrame::Keepalive(now_micros()), 2, id, &rnk, &hmac);
+        let _sent = roamed.send_to(&fresh, server_addr).await?;
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            roam_rx.try_recv().ok(),
+            Some(roamed_addr),
+            "a fresh packet from a new address should roam the session"
+        );
+
+        token.cancel();
+        drop(handle.await);
+        Ok(())
+    }
 
     fn make_reader_sync() -> UdpReader {
         // Build a UdpReader synchronously using a blocking socket creation.
