@@ -1484,7 +1484,7 @@ impl KexReader {
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn validate_user(&self, user: &str) -> Result<bool> {
         let mut is_valid_user = Command::new("id");
         let _ = is_valid_user.arg(user);
@@ -1517,7 +1517,7 @@ impl KexReader {
         Ok(output.status.success())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn get_home_dir_shell(&self, user: &str) -> Result<(String, String)> {
         let mut cmd = Command::new("getent");
         let _ = cmd.args(["passwd", user]);

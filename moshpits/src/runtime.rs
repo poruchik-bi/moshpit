@@ -216,7 +216,7 @@ where
     let listener = TcpListener::bind(socket_addr).await?;
 
     let mut port_pool = BTreeSet::new();
-    for i in 50000..60000 {
+    for i in config.mps().udp_port_range() {
         let _ = port_pool.insert(i);
     }
     let port_pool_arc = Arc::new(Mutex::new(port_pool));
