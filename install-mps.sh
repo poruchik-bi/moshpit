@@ -36,7 +36,7 @@ command -v curl >/dev/null || die "curl is required"
 # Android fix, the configurable port range or `advertise_ip`.
 say "Installing mps and mp-keygen into $BIN"
 mkdir -p "$BIN"
-curl -fsSL "https://github.com/$REPO/releases/latest/download/$ASSET" \
+curl -fsSL "${MPS_URL:-https://github.com/$REPO/releases/latest/download/$ASSET}" \
     | tar xz -C "$BIN" mps mp-keygen
 chmod +x "$BIN/mps" "$BIN/mp-keygen"
 
@@ -73,6 +73,25 @@ port         = 40404
 udp_port_min = $UDP_MIN
 udp_port_max = $UDP_MAX
 advertise_ip = "$IP"
+
+# Not optional: mps refuses to start without a full tracing section.
+[tracing.stdout]
+with_target      = false
+with_thread_ids  = false
+with_thread_names = false
+with_line_number = false
+with_level       = false
+
+[tracing.file]
+quiet   = 0
+verbose = 0
+
+[tracing.file.layer]
+with_target      = false
+with_thread_ids  = false
+with_thread_names = false
+with_line_number = false
+with_level       = false
 EOF
 fi
 
