@@ -31,6 +31,21 @@ pub struct Mps {
     #[serde(default = "default_udp_port_max")]
     #[getset(get_copy = "pub")]
     udp_port_max: u16,
+    /// Address to advertise to clients for the data session, when it differs
+    /// from the interface they connected to.
+    ///
+    /// The server normally tells a client to send its data packets to the local
+    /// address of the accepted TCP connection. That is right until the key
+    /// exchange arrives through a tunnel: a client reaching `mps` over an SSH
+    /// port forward connects to `127.0.0.1` and is then told to send UDP
+    /// there — to its own loopback. Set this to the host's public IP and the
+    /// key exchange can stay on loopback while the data session still lands on
+    /// an address the client can reach.
+    ///
+    /// Empty (the default) keeps the existing behaviour.
+    #[serde(default)]
+    #[getset(get = "pub")]
+    advertise_ip: String,
 }
 
 const fn default_udp_port_min() -> u16 {
@@ -54,6 +69,19 @@ impl Mps {
             default_udp_port_min()..=default_udp_port_max()
         } else {
             min..=max
+        }
+    }
+
+    /// `local` with its IP replaced by `advertise_ip`, when that is set and parses.
+    ///
+    /// An unparseable value falls back to `local` rather than failing the
+    /// connection: a typo in this field should not take the server down, and
+    /// the old behaviour is still a working one on a directly-reachable host.
+    #[must_use]
+    pub fn advertise_addr(&self, local: std::net::SocketAddr) -> std::net::SocketAddr {
+        match self.advertise_ip.parse() {
+            Ok(ip) => std::net::SocketAddr::new(ip, local.port()),
+            Err(_) => local,
         }
     }
 }
@@ -80,6 +108,33 @@ mod tests {
     fn the_default_range_is_unchanged_when_unset() {
         let m: Mps = toml::from_str("ip = \"0.0.0.0\"\nport = 40404\n").expect("defaults");
         assert_eq!(m.udp_port_range(), 50000..=59999);
+    }
+
+    #[test]
+    fn advertise_ip_replaces_only_the_address() {
+        let local = "127.0.0.1:50001".parse().expect("hardcoded test address");
+        let m: Mps = toml::from_str("ip = \"127.0.0.1\"\nport = 40404\nadvertise_ip = \"203.0.113.7\"\n")
+            .expect("valid mps config");
+        assert_eq!(
+            m.advertise_addr(local),
+            "203.0.113.7:50001".parse().expect("hardcoded test address")
+        );
+    }
+
+    /// Unset or nonsense must not break a host that is directly reachable.
+    #[test]
+    fn advertise_ip_falls_back_to_the_local_address() {
+        let local: std::net::SocketAddr =
+            "10.0.0.4:50001".parse().expect("hardcoded test address");
+        for value in ["", "not-an-ip", "203.0.113.7:9"] {
+            let m: Mps = toml::from_str(&format!(
+                "ip = \"0.0.0.0\"\nport = 40404\nadvertise_ip = \"{value}\"\n"
+            ))
+            .expect("valid mps config");
+            assert_eq!(m.advertise_addr(local), local, "advertise_ip = {value:?}");
+        }
+        let unset: Mps = toml::from_str("ip = \"0.0.0.0\"\nport = 40404\n").expect("defaults");
+        assert_eq!(unset.advertise_addr(local), local);
     }
 
     /// A reversed or zero range would make an empty pool, and the only symptom

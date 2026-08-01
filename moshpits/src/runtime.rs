@@ -252,8 +252,15 @@ where
                             Ok(a) => a,
                             Err(e) => { error!("local_addr: {e}"); continue; }
                         };
+                        // …unless `advertise_ip` says otherwise: a key exchange arriving
+                        // through an SSH tunnel has a loopback local address, which would
+                        // send the client's data packets to its own machine.
+                        let advertised = config_c.mps().advertise_addr(tcp_local_addr);
+                        if advertised != tcp_local_addr {
+                            trace!("advertising {advertised} instead of {tcp_local_addr}");
+                        }
                         let mut config_conn = config_c;
-                        let _ = config_conn.set_mode(KexMode::Server(tcp_local_addr));
+                        let _ = config_conn.set_mode(KexMode::Server(advertised));
                         let _conn = spawn(async move {
                             if let Err(e) = handle_connection(config_conn, socket, st, fr_c).await {
                                 error!("{e}");

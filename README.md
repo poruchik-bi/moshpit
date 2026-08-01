@@ -770,6 +770,15 @@ quiet   = 0
 ip   = "0.0.0.0"   # IP address to listen on
 port = 40404       # TCP port to listen on for client connections
 
+# Address clients should send their data packets to, when it differs from the
+# interface they connected on. The server normally advertises the local address
+# of the accepted TCP connection — right until the key exchange arrives through
+# a tunnel, where that address is 127.0.0.1 and the client would be told to send
+# UDP to its own loopback. Set this to the host's reachable IP to run the key
+# exchange over an SSH forward (`ssh -L 40404:127.0.0.1:40404`) while the data
+# session still lands here. Unset by default.
+# advertise_ip = "203.0.113.7"
+
 # ── Key files ─────────────────────────────────────────────────────────────────
 # Defaults to ~/.mp/mps_host_x25519_key and ~/.mp/mps_host_x25519_key.pub
 # when not set.

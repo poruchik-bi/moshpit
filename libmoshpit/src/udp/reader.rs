@@ -895,7 +895,7 @@ impl UdpReader {
             // port could otherwise claim a freshly bound session by racing the
             // real client, and the server would send its output to them.
             // Unauthenticated datagrams are discarded without touching state.
-            let peer_addr = loop {
+            loop {
                 let (first_len, peer_addr) = self.socket.recv_from(&mut buf).await?;
                 // Process the first packet through the normal pipeline.
                 let mut first_buf = BytesMut::from(&buf[..first_len]);
@@ -959,8 +959,7 @@ impl UdpReader {
                     }
                 }
                 break peer_addr;
-            };
-            peer_addr
+            }
         };
 
         // Park the NAK deadline far in the future when gap_first_seen is empty — there
