@@ -495,6 +495,50 @@ async fn handle_connection(
             let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(512);
             let udp_recv = udp_arc.clone();
             let udp_send = udp_arc.clone();
+
+            // Give this connection's data port back when the connection ends,
+            // rather than when the shell does.
+            //
+            // A session outlives its client on purpose — that is what makes
+            // resume possible — but the port is useless without a client, and a
+            // resumed session is told a new address during its key exchange.
+            // Waiting for the PTY to exit means a long-lived shell (a zellij
+            // pane, say) holds its port for as long as it runs, and the pool
+            // drains one port per reconnect until everything fails with "no
+            // available UDP port in pool". Reproduced with a ten-port range: the
+            // eleventh connection could not be served while nothing at all was
+            // listening on any of them.
+            if let Ok(local) = udp_arc.local_addr() {
+                let released = local.port();
+                let release_pool = port_pool.clone();
+                let release_token = conn_token.clone();
+                let _release = spawn(async move {
+                    release_token.cancelled().await;
+                    // Cancelling does not close the socket: the reader and
+                    // sender tasks hold it until they next wake up. A port
+                    // number handed back before its socket is gone is worse
+                    // than one never handed back at all — every later bind
+                    // fails, and the server reports the pool as exhausted while
+                    // most of it is free. So prove it is bindable first.
+                    for attempt in 0..40u32 {
+                        match tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, released)).await {
+                            Ok(probe) => {
+                                drop(probe);
+                                let mut pool = release_pool.lock().await;
+                                let _ = pool.insert(released);
+                                trace!("returned UDP port {released} to the pool");
+                                return;
+                            }
+                            // `sleep` in this module is the blocking one; this task must not.
+                            Err(_) => tokio::time::sleep(Duration::from_millis(
+                                100 * u64::from(attempt.min(5) + 1),
+                            ))
+                            .await,
+                        }
+                    }
+                    warn!("UDP port {released} never came free; leaving it out of the pool");
+                });
+            }
             // Oneshot carries the initial peer SocketAddr from UdpReader to UdpSender.
             let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<SocketAddr>();
             // mpsc carries mid-session NAT roam updates from UdpReader to UdpSender.

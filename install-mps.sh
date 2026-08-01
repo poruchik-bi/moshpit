@@ -98,6 +98,15 @@ fi
 # ── run it ──────────────────────────────────────────────────────────────────
 listening() { ss -ltnH 2>/dev/null | grep -q '127\.0\.0\.1:40404'; }
 
+# Running this again is how you upgrade, so a server that is already up has to
+# be replaced rather than left alone — otherwise the new binary sits on disk
+# while the old one keeps serving.
+if listening; then
+    say "Restarting the running mps onto the new binary"
+    pkill -x mps || true
+    sleep 1
+fi
+
 if listening; then
     say "mps is already listening on 127.0.0.1:40404"
 else
