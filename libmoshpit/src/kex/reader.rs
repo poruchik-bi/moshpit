@@ -50,9 +50,10 @@ use bytes::BytesMut;
 use socket2::SockRef;
 use tokio::{
     net::{TcpListener, UdpSocket},
-    process::Command,
     sync::{Mutex, mpsc::UnboundedSender},
 };
+#[cfg(not(target_os = "ios"))]
+use tokio::process::Command;
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
@@ -1517,6 +1518,13 @@ impl KexReader {
         Ok(output.status.success())
     }
 
+    // Server-side only; the phone embeds the client. Needs to compile so the
+    // crate links — never runs on iOS.
+    #[cfg(target_os = "ios")]
+    async fn validate_user(&self, _user: &str) -> Result<bool> {
+        Err(MoshpitError::KeyNotEstablished.into())
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn get_home_dir_shell(&self, user: &str) -> Result<(String, String)> {
         let mut cmd = Command::new("getent");
@@ -1589,6 +1597,11 @@ impl KexReader {
             }
             return Ok((home_dir, String::from("cmd.exe")));
         }
+        Err(MoshpitError::KeyNotEstablished.into())
+    }
+
+    #[cfg(target_os = "ios")]
+    async fn get_home_dir_shell(&self, _user: &str) -> Result<(String, String)> {
         Err(MoshpitError::KeyNotEstablished.into())
     }
 }
