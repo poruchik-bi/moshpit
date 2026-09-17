@@ -55,7 +55,7 @@ use tokio::{
         mpsc::{Receiver, Sender, channel},
         oneshot,
     },
-    time::{Instant as TokioInstant, MissedTickBehavior, interval, sleep_until},
+    time::{Instant as TokioInstant, MissedTickBehavior, interval, interval_at, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
@@ -135,6 +135,10 @@ const MAX_STATESYNC_DIFF_BYTES: usize = 900;
 const STATE_CHUNK_SIZE: usize = 800;
 /// How long with no UDP frame received from the client before the server cancels the connection.
 const CLIENT_SILENCE_TIMEOUT_US: u64 = 30_000_000;
+
+/// How often [`spawn_silence_watchdog`] looks, and all the grace a connection
+/// gets to receive its very first datagram.
+const TICK: Duration = Duration::from_secs(5);
 
 /// Current time as microseconds since the UNIX epoch.
 fn now_micros() -> u64 {
@@ -486,7 +490,12 @@ async fn handle_connection(
     let (repaint_tx, mut repaint_rx) = channel::<()>(1);
     let (client_ack_tx, mut client_ack_rx) = channel::<u64>(16);
     let nak_received_count = Arc::new(AtomicU64::new(0));
-    let last_rx_us = Arc::new(AtomicU64::new(now_micros()));
+    // Zero until the client's first datagram lands, so the silence watchdog can
+    // tell "a session that went quiet" from "a key exchange nobody came back
+    // for". The first is worth thirty seconds — that is what riding out a roam
+    // looks like. The second is worth five: it is holding a UDP port out of a
+    // ten-wide pool, and no client will ever resume it because none arrived.
+    let last_rx_us = Arc::new(AtomicU64::new(0));
     let mac_tag_len = kex.mac_tag_len();
 
     // Set up the data-channel reader and sender based on the negotiated transport.
@@ -888,6 +897,12 @@ async fn handle_connection(
         server_emulator.clone(),
     );
 
+    // ponytail: a session whose client never sent a datagram keeps its login
+    // shell for ever — the watchdog above frees the UDP port, which is the scarce
+    // thing, but nothing reaps the `bash -li`. To fix it, carry the shell's pid
+    // on the output handle and hang it up when a connection this branch created
+    // is cancelled before first contact. Guard it on `maybe_term_rx` being
+    // `Some`: a *resumed* connection is holding somebody's live work.
     // For new sessions, spawn the long-lived PTY thread.
     if let Some(term_rx) = maybe_term_rx {
         spawn_pty(
@@ -1027,12 +1042,25 @@ async fn send_state_chunked(ss_tx: &Sender<EncryptedFrame>, compressed: Vec<u8>)
 /// [`CLIENT_SILENCE_TIMEOUT_US`] microseconds.  Fires every 5 s; low overhead.
 fn spawn_silence_watchdog(token: CancellationToken, last_rx_us: Arc<AtomicU64>) {
     let _watchdog = spawn(async move {
-        let mut ticker = interval(Duration::from_secs(5));
+        // `interval` yields its first tick straight away, which would cancel
+        // every connection before its client's first datagram could possibly
+        // arrive. Start one period in.
+        let mut ticker = interval_at(TokioInstant::now() + TICK, TICK);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             select! {
                 () = token.cancelled() => break,
                 _ = ticker.tick() => {
+                    // Zero means not one datagram has ever arrived. That is not a
+                    // session riding out a roam, it is a key exchange whose client
+                    // walked away — nobody can resume it, and it is holding a UDP
+                    // port out of a pool ten wide. One tick is already longer than
+                    // the client waits for its own first byte.
+                    if last_rx_us.load(Ordering::Relaxed) == 0 {
+                        info!("No first datagram within {TICK:?}: cancelling connection");
+                        token.cancel();
+                        break;
+                    }
                     let elapsed_us = now_micros().saturating_sub(last_rx_us.load(Ordering::Relaxed));
                     if elapsed_us > CLIENT_SILENCE_TIMEOUT_US {
                         info!("Client silence timeout (30 s): cancelling connection");
@@ -2869,6 +2897,9 @@ mod test {
         let last_rx_us = Arc::new(AtomicU64::new(0));
         spawn_silence_watchdog(token.clone(), last_rx_us);
 
+        // Let the task start its ticker before the clock moves, or the first
+        // tick is scheduled relative to a time that has already gone by.
+        yield_now().await;
         // Advance past two 5-second ticker intervals + the 30-second silence threshold.
         advance(Duration::from_secs(35)).await;
         // Yield so the spawned task can run.
@@ -2897,6 +2928,34 @@ mod test {
             "watchdog should not fire within 30s silence threshold"
         );
         token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_watchdog_gives_the_first_datagram_a_tick_to_arrive() {
+        // What this pins: the watchdog treats "never heard from" as a reason to
+        // cancel, and `interval` hands out its first tick immediately — so
+        // without a delayed start every connection was cancelled the instant it
+        // was set up, before the client's first datagram could cross the wire.
+        let token = CancellationToken::new();
+        let last_rx_us = Arc::new(AtomicU64::new(0));
+        spawn_silence_watchdog(token.clone(), last_rx_us.clone());
+
+        advance(Duration::from_secs(1)).await;
+        yield_now().await;
+        yield_now().await;
+        assert!(
+            !token.is_cancelled(),
+            "cancelled before the client could possibly have said anything"
+        );
+
+        // …and it does still fire for a client that never turns up.
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+        yield_now().await;
+        assert!(
+            token.is_cancelled(),
+            "an exchange nobody came back for holds its UDP port for ever"
+        );
     }
 
     #[tokio::test(start_paused = true)]

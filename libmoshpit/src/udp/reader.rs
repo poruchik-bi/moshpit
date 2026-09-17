@@ -896,7 +896,18 @@ impl UdpReader {
             // real client, and the server would send its output to them.
             // Unauthenticated datagrams are discarded without touching state.
             loop {
-                let (first_len, peer_addr) = self.socket.recv_from(&mut buf).await?;
+                // Cancellable, because this is the one wait a connection can sit
+                // in forever: a client that walked away between the key exchange
+                // and its first datagram never sends one. A bare `recv_from`
+                // here ignored `token.cancel()`, so the task kept its
+                // `Arc<UdpSocket>` alive, the port stayed bound, and whoever was
+                // waiting to put it back in the pool could never rebind it. Ten
+                // abandoned attempts is the whole default pool, and moshpit was
+                // then refused for everybody until the server was restarted.
+                let (first_len, peer_addr) = select! {
+                    () = token.cancelled() => return Ok(()),
+                    read = self.socket.recv_from(&mut buf) => read?,
+                };
                 // Process the first packet through the normal pipeline.
                 let mut first_buf = BytesMut::from(&buf[..first_len]);
                 match self.parse_encrypted_frame(&mut first_buf) {
