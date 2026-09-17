@@ -11,6 +11,9 @@ use vergen_gix::{Build, Cargo, Emitter, Gix, Rustc, Sysinfo};
 
 pub fn main() -> Result<()> {
     println!("cargo:rustc-check-cfg=cfg(coverage_nightly)");
+    // Without this a warm target directory keeps whatever tag it was last built
+    // with, and a release publishes a binary that names the release before it.
+    println!("cargo:rerun-if-env-changed=MPS_RELEASE");
     nightly();
     Emitter::default()
         .add_instructions(&Build::all_build())?

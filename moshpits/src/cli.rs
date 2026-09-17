@@ -14,10 +14,22 @@ use getset::{CopyGetters, Getters};
 use libmoshpit::PathDefaults;
 use vergen_pretty::{Pretty, vergen_pretty_env};
 
+/// What this binary calls itself, and the only string anything should parse to
+/// find out which build it is talking to. The crate version cannot be that: it
+/// is `0.9.4` for every `v0.9.4-android.N` release, so nothing — not an
+/// installer, not a client deciding whether the server needs updating — can tell
+/// two of them apart. `just server-release` stamps the tag it is about to
+/// publish, so the binary and its release page cannot disagree; a build from a
+/// working copy says `+dev` rather than claiming to be a release.
+pub(crate) const RELEASE: &str = match option_env!("MPS_RELEASE") {
+    Some(tag) => tag,
+    None => concat!(env!("CARGO_PKG_VERSION"), "+dev"),
+};
+
 static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
     let pretty = Pretty::builder().env(vergen_pretty_env!()).build();
     let mut cursor = Cursor::new(vec![]);
-    let mut output = env!("CARGO_PKG_VERSION").to_string();
+    let mut output = RELEASE.to_string();
     output.push_str("\n\n");
     pretty
         .display(&mut cursor)
@@ -27,7 +39,7 @@ static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
 });
 
 #[derive(Clone, CopyGetters, Debug, Getters, Parser)]
-#[command(author, version, about, long_version = LONG_VERSION.as_str(), long_about = None)]
+#[command(author, version = RELEASE, about, long_version = LONG_VERSION.as_str(), long_about = None)]
 pub(crate) struct Cli {
     /// Set logging verbosity.  More v's, more verbose.
     #[clap(
