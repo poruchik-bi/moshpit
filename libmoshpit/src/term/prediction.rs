@@ -195,6 +195,14 @@ pub struct OverlayCursor {
 
 // ── main engine ─────────────────────────────────────────────────────────────
 
+/// Where the user's byte stream is in an escape sequence. See `escape_byte`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InputState {
+    Ground,
+    Esc,
+    Csi,
+}
+
 /// Local-echo prediction engine.
 #[derive(Debug)]
 pub struct PredictionEngine {
@@ -217,7 +225,11 @@ pub struct PredictionEngine {
     send_interval_ms: u64,
 
     /// The last byte the user typed (used for multi-byte key detection).
-    last_byte: u8,
+    /// Where the user's own byte stream is in an escape sequence. Input is fed
+    /// in one byte at a time, so without this `ESC [ C` is an ESC followed by
+    /// two perfectly printable characters — and they were predicted onto the
+    /// line as if somebody had typed them.
+    input: InputState,
 
     /// Consecutive "quick" confirmations (< `GLITCH_THRESHOLD_MS`) seen since
     /// last glitch — used to decay the glitch counter.
@@ -244,7 +256,7 @@ impl PredictionEngine {
             srtt_trigger: false,
             glitch_trigger: 0,
             send_interval_ms: 0,
-            last_byte: 0,
+            input: InputState::Ground,
             glitch_repair_count: 0,
             last_quick_confirmation: Instant::now(),
             display_preference,
@@ -362,6 +374,27 @@ impl PredictionEngine {
 
     // ── public API ───────────────────────────────────────────────────────
 
+    /// Nothing is predicted for anything but `Ground`: what a control sequence
+    /// does is the far end's business, and guessing at it is what put `[C` on
+    /// the screen.
+    ///
+    /// Only what a terminal *sends* needs covering, which is a small set — CSI
+    /// (`ESC [` … final byte), SS3 (`ESC O` + one byte, what some keypads send
+    /// for the arrows), and the two-byte escapes a meta key produces.
+    fn escape_byte(&mut self, byte: u8) -> bool {
+        self.input = match (self.input, byte) {
+            (InputState::Ground, 0x1b) => InputState::Esc,
+            (InputState::Ground, _) => return false,
+            (InputState::Esc, b'[') | (InputState::Esc, b'O') => InputState::Csi,
+            // `ESC` then anything else is a two-byte sequence, complete here.
+            (InputState::Esc, _) => InputState::Ground,
+            // Parameter and intermediate bytes; a final byte ends it.
+            (InputState::Csi, 0x20..=0x3f) => InputState::Csi,
+            (InputState::Csi, _) => InputState::Ground,
+        };
+        true
+    }
+
     /// Record a speculative prediction for a newly typed byte.
     ///
     /// `screen` is the current terminal state (before the server has echoed
@@ -371,6 +404,17 @@ impl PredictionEngine {
         if rows == 0 || cols == 0 {
             return;
         }
+        // Inside an escape sequence nothing is predicted — not the bytes that
+        // make it up, and not a cursor move for a key whose effect is unknown
+        // here. ESC itself still invalidates what is in flight, because the far
+        // end is about to move somewhere this side cannot work out.
+        if self.escape_byte(byte) {
+            if byte == 0x1b {
+                self.become_tentative();
+            }
+            return;
+        }
+
         let (cursor_row, cursor_col) = screen.cursor_position();
 
         // Determine predicted cursor start position (use our last cursor
@@ -435,13 +479,6 @@ impl PredictionEngine {
                 self.push_cursor(pred_row, new_col, epoch);
             }
 
-            // ── left arrow (ESC [ D) ─────────────────────────────────────
-            0x1b if self.last_byte == b'[' => {
-                // We only get here if last_byte was '['; not reliable without a
-                // full input parser, so treat as tentative.
-                self.become_tentative();
-            }
-
             // ── carriage return: move predicted cursor to next line ───────
             // Match mosh exactly: become_tentative() then newline_carriage_return().
             // This moves the cursor prediction to (row+1, 0), or for the last
@@ -452,13 +489,12 @@ impl PredictionEngine {
                 self.newline_carriage_return((cursor_row, cursor_col), rows, cols);
             }
 
-            // ── newline / ESC / other control characters ─────────────────
+            // ── newline and the other control characters ─────────────────
+            // ESC never reaches here: `escape_byte` took it.
             b'\n' | 0x00..=0x1f | 0x80..=0xff => {
                 self.become_tentative();
             }
         }
-
-        self.last_byte = byte;
     }
 
     fn push_cursor(&mut self, row: u16, col: u16, epoch: u64) {
@@ -648,7 +684,7 @@ impl PredictionEngine {
         self.confirmed_epoch = 0;
         self.glitch_trigger = 0;
         self.glitch_repair_count = 0;
-        self.last_byte = 0;
+        self.input = InputState::Ground;
     }
 }
 
@@ -904,6 +940,81 @@ mod tests {
         // After ESC the engine resets (no active predictions visible)
         let (cells, _cursor) = engine.apply(parser.screen());
         assert!(cells.is_empty(), "ESC should clear/reset predictions");
+    }
+
+    /// A key bar arrow sends `ESC [ C`. Fed a byte at a time, `[` and `C` both
+    /// land in the printable range, so an engine with no escape parser predicts
+    /// them as typed characters at the cursor and pushes the cursor two columns
+    /// right for a key that moves it one.
+    ///
+    /// Nothing downstream should have to clean that up. It is cleaned up today
+    /// — the runaway cursor prediction misses the real one and `cull` resets the
+    /// whole engine — but that means every arrow throws away the predictions
+    /// either side of it, and the junk is one confirmed epoch away from being
+    /// painted. Predicting a control sequence as text is wrong at the source.
+    #[test]
+    fn an_arrow_key_is_not_two_letters() {
+        for (seq, name) in [
+            (&b"\x1b[C"[..], "right"),
+            (&b"\x1b[D"[..], "left"),
+            (&b"\x1b[A"[..], "up"),
+            (&b"\x1b[1;5C"[..], "ctrl-right"),
+            (&b"\x1b[5~"[..], "page up"),
+            (&b"\x1bOC"[..], "SS3 right"),
+            (&b"\x1bb"[..], "alt-b"),
+            (&b"\x1b"[..], "a bare Esc"),
+        ] {
+            let mut engine = PredictionEngine::new(DisplayPreference::Always);
+            let screen = make_screen(24, 80, b"hello world\x1b[1;1H");
+            for &byte in seq {
+                engine.new_user_byte(byte, screen.screen());
+            }
+            let painted: String = engine
+                .overlay_rows
+                .iter()
+                .flat_map(|r| r.cells.iter().map(|c| c.replacement))
+                .collect();
+            assert!(
+                painted.is_empty(),
+                "{name} predicted the characters {painted:?} onto the line",
+            );
+            assert!(
+                engine.cursors.is_empty(),
+                "{name} moved the predicted cursor {} columns",
+                engine.cursors.len(),
+            );
+        }
+    }
+
+    /// ...and the engine has to come back out of the sequence, or every
+    /// character typed after an arrow would be swallowed with it.
+    ///
+    /// Asserted on the predictions themselves rather than on what `apply`
+    /// paints: a prediction made after an escape is tentative until the server
+    /// confirms the epoch, which is correct and is not what this is about.
+    #[test]
+    fn typing_resumes_once_the_sequence_ends() {
+        for (seq, name) in [
+            (&b"\x1b[C"[..], "a CSI arrow"),
+            (&b"\x1bOC"[..], "an SS3 arrow"),
+            (&b"\x1bb"[..], "a two-byte escape"),
+            (&b"\x1b[1;5C"[..], "a parameterised CSI"),
+        ] {
+            let mut engine = PredictionEngine::new(DisplayPreference::Always);
+            let screen = make_screen(24, 80, b"\x1b[1;1H");
+            for &byte in seq {
+                engine.new_user_byte(byte, screen.screen());
+            }
+            for &byte in b"ab" {
+                engine.new_user_byte(byte, screen.screen());
+            }
+            let predicted: String = engine
+                .overlay_rows
+                .iter()
+                .flat_map(|r| r.cells.iter().map(|c| c.replacement))
+                .collect();
+            assert_eq!(predicted, "ab", "{name} swallowed the letters typed after it");
+        }
     }
 
     #[test]
