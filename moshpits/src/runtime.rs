@@ -39,7 +39,7 @@ use libmoshpit::{
     DiffMode, EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, NegotiatedTransport,
     SessionRegistry, TcpTransportReader, TcpTransportSender, TerminalMessage, UdpReader, UdpSender,
     UuidWrapper, env_var_matches, init_tracing, is_exit_title, load, new_session_registry,
-    run_key_exchange,
+    run_key_exchange, screen_snapshot,
 };
 #[cfg(windows)]
 use portable_pty::CommandBuilder;
@@ -335,7 +335,7 @@ async fn resolve_session(
             // Send current screen state for an instant clean repaint on reconnect.
             let screen_state = {
                 let emu = server_emulator.lock().await;
-                emu.screen().contents_formatted()
+                screen_snapshot(emu.screen())
             };
             let screen_state_bytes = screen_state.len();
             let compressed =
@@ -663,26 +663,22 @@ async fn handle_connection(
                             break;
                         }
                         while repaint_rx.try_recv().is_ok() {}
-                        let (contents, is_alt) = {
+                        // `screen_snapshot` and not `contents_formatted`: the
+                        // latter is cells only, so the modes a fresh parser
+                        // needs to come up in the right state ride with it.
+                        let contents = {
                             let emu = ss_emu.lock().await;
-                            let screen = emu.screen();
-                            (screen.contents_formatted(), screen.alternate_screen())
+                            screen_snapshot(emu.screen())
                         };
                         let compressed = encode_all(contents.as_slice(), 3)
                             .unwrap_or_else(|_| contents.clone());
                         if !send_state_chunked(&ss_tx, compressed).await {
                             break;
                         }
-                        // Reset ack baseline to match client's reset after ScreenStateCompressed.
-                        // Store alt-screen-aware: prefix \033[?1049h so a fresh parser reconstructs
-                        // the correct screen mode when computing future diffs.
-                        let mut ack = contents;
-                        if is_alt {
-                            let mut prefixed = b"\x1b[?1049h".to_vec();
-                            prefixed.extend_from_slice(&ack);
-                            ack = prefixed;
-                        }
-                        ack_state = ack;
+                        // The ack baseline is the same bytes the client just
+                        // rebuilt from, so future diffs are computed against
+                        // what it actually shows.
+                        ack_state = contents;
                         ack_diff_id = 0;
                         sent_states.clear();
                         ack_dirty = true;
@@ -702,13 +698,12 @@ async fn handle_connection(
                         if now_dirty == last_dirty && !ack_dirty && ack_diff_id == diff_counter {
                             continue;
                         }
-                        let (current, rows, cols, is_alt) = {
+                        let (current, rows, cols, is_alt, is_bracketed) = {
                             let emu = ss_emu.lock().await;
                             let screen = emu.screen();
-                            let formatted = screen.contents_formatted();
+                            let snapshot = screen_snapshot(screen);
                             let (r, c) = screen.size();
-                            let alt = screen.alternate_screen();
-                            (formatted, r, c, alt)
+                            (snapshot, r, c, screen.alternate_screen(), screen.bracketed_paste())
                         };
                         // Skip expensive parser work when client is fully caught up and
                         // the screen hasn't changed since the last tick.
@@ -724,6 +719,7 @@ async fn handle_connection(
                             ack_parser.process(&ack_state);
                         }
                         let ack_is_alt = ack_parser.screen().alternate_screen();
+                        let ack_is_bracketed = ack_parser.screen().bracketed_paste();
                         let mut cur_parser = vt100::Parser::new(rows, cols, 0);
                         cur_parser.process(&current);
                         let mut diff = Vec::new();
@@ -731,6 +727,16 @@ async fn handle_connection(
                             diff.extend_from_slice(b"\x1b[?1049h");
                         } else if !is_alt && ack_is_alt {
                             diff.extend_from_slice(b"\x1b[?1049l");
+                        }
+                        // `contents_diff` is cells, so a mode that flipped with
+                        // nothing else changing produces an empty diff and the
+                        // client never hears about it. Bracketed paste is the
+                        // one it decides from: a prompt turning it on is often
+                        // the only thing that happened this tick.
+                        if is_bracketed && !ack_is_bracketed {
+                            diff.extend_from_slice(b"\x1b[?2004h");
+                        } else if !is_bracketed && ack_is_bracketed {
+                            diff.extend_from_slice(b"\x1b[?2004l");
                         }
                         let content_diff = cur_parser.screen().contents_diff(ack_parser.screen());
                         if content_diff.is_empty() && diff.is_empty() {
@@ -751,13 +757,7 @@ async fn handle_connection(
                             if !send_state_chunked(&ss_tx, full_compressed).await {
                                 break;
                             }
-                            let mut ack = current;
-                            if is_alt {
-                                let mut prefixed = b"\x1b[?1049h".to_vec();
-                                prefixed.extend_from_slice(&ack);
-                                ack = prefixed;
-                            }
-                            ack_state = ack;
+                            ack_state = current;
                             ack_diff_id = 0;
                             sent_states.clear();
                         } else {
@@ -769,14 +769,7 @@ async fn handle_connection(
                             {
                                 break;
                             }
-                            // Store alt-screen-aware snapshot so ack-state reconstruction is correct.
-                            let mut snapshot = current;
-                            if is_alt {
-                                let mut prefixed = b"\x1b[?1049h".to_vec();
-                                prefixed.extend_from_slice(&snapshot);
-                                snapshot = prefixed;
-                            }
-                            sent_states.push_back((diff_counter, snapshot));
+                            sent_states.push_back((diff_counter, current));
                             if sent_states.len() > STATESYNC_HISTORY_LEN {
                                 drop(sent_states.pop_front());
                             }
@@ -827,7 +820,7 @@ async fn handle_connection(
                         last_dirty = current;
                         let contents = {
                             let emu = sync_emu.lock().await;
-                            emu.screen().contents_formatted()
+                            screen_snapshot(emu.screen())
                         };
                         let compressed = encode_all(contents.as_slice(), 3)
                             .unwrap_or_else(|_| contents.clone());
@@ -855,7 +848,7 @@ async fn handle_connection(
                         while repaint_rx.try_recv().is_ok() {}
                         let contents = {
                             let emu = repaint_emu.lock().await;
-                            emu.screen().contents_formatted()
+                            screen_snapshot(emu.screen())
                         };
                         let compressed = encode_all(contents.as_slice(), 3)
                             .unwrap_or_else(|_| contents.clone());
@@ -879,7 +872,7 @@ async fn handle_connection(
                         () = tokio::time::sleep(DATAGRAM_REPAINT_INTERVAL) => {
                             let contents = {
                                 let emu = datagram_emu.lock().await;
-                                emu.screen().contents_formatted()
+                                screen_snapshot(emu.screen())
                             };
                             let compressed = encode_all(contents.as_slice(), 3)
                                 .unwrap_or_else(|_| contents.clone());
@@ -1173,7 +1166,7 @@ fn spawn_connection_health_task(
                     if delta >= PROACTIVE_REPAINT_NAK_THRESHOLD {
                         let contents = {
                             let emu = server_emulator.lock().await;
-                            emu.screen().contents_formatted()
+                            screen_snapshot(emu.screen())
                         };
                         let compressed = encode_all(contents.as_slice(), 3)
                             .unwrap_or_else(|_| contents.clone());

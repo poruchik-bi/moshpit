@@ -42,6 +42,44 @@ use std::{
 use super::emulator::Emulator;
 use super::prediction::{OverlayCell, OverlayCursor, PredictionEngine};
 
+/// The modes `vt100::Screen::contents_formatted()` leaves out.
+///
+/// That call serialises cells, so a screen rebuilt from it comes up on the main
+/// buffer with every mode off. The alt-screen enter was already patched back in
+/// by hand at each call site; bracketed paste has to be too, and for a sharper
+/// reason — the *client* decides whether to wrap a paste from this mode (DECSET
+/// 2004), and a client that never hears about it sends a multi-line clipboard
+/// raw. Every newline in it is then an Enter, so pasting an agent's output runs
+/// it one line at a time instead of handing it over as text.
+///
+/// Mouse reporting is deliberately absent. It is an input mode like the others,
+/// but forwarding it would start a client receiving events it never asked for,
+/// which is a behaviour change and not a repair.
+#[must_use]
+pub fn screen_modes(screen: &vt100::Screen) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    if screen.alternate_screen() {
+        out.extend_from_slice(b"\x1b[?1049h");
+    }
+    if screen.bracketed_paste() {
+        out.extend_from_slice(b"\x1b[?2004h");
+    }
+    out
+}
+
+/// A screen serialised so that a fresh parser reconstructs it exactly.
+///
+/// `contents_formatted()` is the cells; [`screen_modes`] is what it leaves out.
+/// Every state-sync baseline on both sides of the wire is rebuilt by feeding
+/// these bytes to an empty `vt100::Parser`, so anything missing here is a
+/// difference the two ends will never agree about.
+#[must_use]
+pub fn screen_snapshot(screen: &vt100::Screen) -> Vec<u8> {
+    let mut out = screen_modes(screen);
+    out.extend_from_slice(&screen.contents_formatted());
+    out
+}
+
 /// A stateful differential renderer.
 pub struct Renderer {
     /// Tracks what the user's physical terminal currently looks like.
@@ -179,6 +217,20 @@ impl Renderer {
             self.displayed.process(&full);
             out.extend_from_slice(&full);
             self.initialized = true;
+        }
+
+        // ── 3. input modes ────────────────────────────────────────────────
+        // The alt-screen swap above rides along with the repaint it forces, so
+        // it is emitted with the content. An input mode is not visible on the
+        // screen at all: it can flip with nothing to repaint, and the diff
+        // above — built from `contents_formatted()`, which omits modes — would
+        // never carry it. Emitted last because nothing here depends on order,
+        // and advanced into `displayed` so the next render sees it as shown.
+        let want = screen.bracketed_paste();
+        if want != self.displayed.screen().bracketed_paste() {
+            let seq: &[u8] = if want { b"\x1b[?2004h" } else { b"\x1b[?2004l" };
+            self.displayed.process(seq);
+            out.extend_from_slice(seq);
         }
 
         out
@@ -378,7 +430,7 @@ mod tests {
 
     use super::{
         Emulator, PredictionEngine, Renderer, detect_scroll_up, paint_overlays_to_ansi,
-        render_prediction_update, render_server_update,
+        render_prediction_update, render_server_update, screen_modes,
     };
 
     // Drive a real emulator + renderer and feed every emitted byte into a model
@@ -801,6 +853,90 @@ mod tests {
         assert!(
             s.contains("\x1b[?1049h"),
             "alt-screen enter must appear in output when transitioning to alt-screen: {s:?}"
+        );
+    }
+
+    /// What the client decides from, and what nothing used to tell it.
+    ///
+    /// `contents_formatted()` serialises cells, not modes, so neither the diff
+    /// nor the full repaint carries DECSET 2004. A client reading only the
+    /// rendered stream therefore believed bracketed paste was off for the whole
+    /// life of every session, and sent a multi-line paste raw — one Enter per
+    /// line into whatever was reading.
+    #[test]
+    fn render_emits_bracketed_paste_enter_on_transition() {
+        let mut r = Renderer::new(24, 80);
+        let mut p1 = vt100::Parser::new(24, 80, 0);
+        p1.process(b"$ ");
+        drop(r.render(p1.screen(), &[], None));
+
+        let mut p2 = vt100::Parser::new(24, 80, 0);
+        p2.process(b"$ \x1b[?2004h");
+        let out = r.render(p2.screen(), &[], None);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("\x1b[?2004h"),
+            "bracketed paste enter must reach the client: {s:?}"
+        );
+    }
+
+    #[test]
+    fn render_emits_bracketed_paste_exit_on_transition() {
+        let mut r = Renderer::new(24, 80);
+        let mut p1 = vt100::Parser::new(24, 80, 0);
+        p1.process(b"$ \x1b[?2004h");
+        drop(r.render(p1.screen(), &[], None));
+
+        let mut p2 = vt100::Parser::new(24, 80, 0);
+        p2.process(b"$ ");
+        let out = r.render(p2.screen(), &[], None);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("\x1b[?2004l"),
+            "a program that turned bracketed paste off must be able to say so: {s:?}"
+        );
+    }
+
+    /// The mode is not on the screen, so a repaint has nothing to hang it on.
+    /// Emitting it only on change means the renderer must remember it across
+    /// renders that carry no content at all.
+    #[test]
+    fn bracketed_paste_is_emitted_once_and_not_repeated() {
+        let mut r = Renderer::new(24, 80);
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"$ \x1b[?2004h");
+        let first = r.render(p.screen(), &[], None);
+        let again = r.render(p.screen(), &[], None);
+        assert!(
+            String::from_utf8_lossy(&first).contains("\x1b[?2004h"),
+            "the first render must carry the mode"
+        );
+        assert!(
+            !String::from_utf8_lossy(&again).contains("\x1b[?2004"),
+            "an unchanged mode must not be re-sent on every frame"
+        );
+    }
+
+    /// `screen_modes` is what every call site rebuilding a screen from
+    /// `contents_formatted()` has to prepend, and the reason it exists is that
+    /// the two modes were patched in separately, one of them not at all.
+    #[test]
+    fn screen_modes_carries_what_contents_formatted_drops() {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"\x1b[?1049h\x1b[?2004h");
+        assert_eq!(screen_modes(p.screen()), b"\x1b[?1049h\x1b[?2004h".to_vec());
+
+        let mut plain = vt100::Parser::new(24, 80, 0);
+        plain.process(b"$ ");
+        assert!(screen_modes(plain.screen()).is_empty());
+
+        // Mouse reporting is an input mode too, and must stay out: a client
+        // that never asked for events must not start receiving them.
+        let mut mouse = vt100::Parser::new(24, 80, 0);
+        mouse.process(b"\x1b[?1003h");
+        assert!(
+            screen_modes(mouse.screen()).is_empty(),
+            "mouse reporting must not be forwarded"
         );
     }
 

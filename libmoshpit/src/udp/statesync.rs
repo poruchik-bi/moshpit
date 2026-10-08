@@ -24,7 +24,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::{error, warn};
 
 use crate::{
-    EncryptedFrame, render_server_update,
+    EncryptedFrame, render_server_update, screen_snapshot,
     udp::reader::{ClientRenderCtx, apply_full_state_rendering, decode_all_capped},
 };
 
@@ -70,19 +70,13 @@ impl StateSyncClient {
         );
         // `apply_full_state_rendering` has replaced the emulator's parser with the
         // reconstructed screen, so read the baseline straight back from it.
-        let (mut ack, is_alt) = {
+        let ack = {
             let emu = ctx
                 .emulator()
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let screen = emu.screen();
-            (screen.contents_formatted(), screen.alternate_screen())
+            screen_snapshot(emu.screen())
         };
-        if is_alt {
-            let mut prefixed = b"\x1b[?1049h".to_vec();
-            prefixed.extend_from_slice(&ack);
-            ack = prefixed;
-        }
         self.ack_state = ack;
         self.ack_state_seq = 0;
         self.statesync_mismatch_count = 0;
@@ -145,13 +139,7 @@ impl StateSyncClient {
         tmp.process(&diff_bytes);
         let is_alt = tmp.screen().alternate_screen();
         ctx.in_alt_screen().store(is_alt, Ordering::Relaxed);
-        let mut new_ack = tmp.screen().contents_formatted();
-        if is_alt {
-            let mut prefixed = b"\x1b[?1049h".to_vec();
-            prefixed.extend_from_slice(&new_ack);
-            new_ack = prefixed;
-        }
-        self.ack_state = new_ack;
+        self.ack_state = screen_snapshot(tmp.screen());
         self.ack_state_seq = diff_id;
         // Resync the authoritative emulator to the new state so the prediction
         // engine and local echo stay aligned, then render a single clean update.

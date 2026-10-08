@@ -417,7 +417,8 @@ pub use self::tcp_transport::TcpTransportSender;
 pub use self::term::TerminalMessage;
 pub use self::term::{
     DisplayPreference, Emulator, OverlayCell, OverlayCursor, PredictionEngine, Renderer,
-    paint_overlays_to_ansi, render_prediction_update, render_server_update,
+    paint_overlays_to_ansi, render_prediction_update, render_server_update, screen_modes,
+    screen_snapshot,
 };
 pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::DiffMode;

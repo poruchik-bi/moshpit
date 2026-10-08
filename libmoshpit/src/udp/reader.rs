@@ -42,7 +42,8 @@ use uuid::Uuid;
 use super::DiffMode;
 use crate::{
     Emulator, EncryptedFrame, MoshpitError, PredictionEngine, Renderer, TerminalMessage,
-    UuidWrapper, paint_overlays_to_ansi, render_server_update, udp::sender::RETRANSMIT_WINDOW,
+    UuidWrapper, paint_overlays_to_ansi, render_server_update, screen_snapshot,
+    udp::sender::RETRANSMIT_WINDOW,
     utils::is_exit_title,
 };
 
@@ -1162,13 +1163,7 @@ impl UdpReader {
         let is_alt = tmp.screen().alternate_screen();
         in_alt_screen.store(is_alt, Ordering::Relaxed);
         if self.diff_mode == DiffMode::StateSync {
-            let mut ack = tmp.screen().contents_formatted();
-            if is_alt {
-                let mut prefixed = b"\x1b[?1049h".to_vec();
-                prefixed.extend_from_slice(&ack);
-                ack = prefixed;
-            }
-            self.ack_state = ack;
+            self.ack_state = screen_snapshot(tmp.screen());
             self.ack_state_seq = 0;
             self.statesync_mismatch_count = 0;
             self.initial_state_received = true;
@@ -1577,13 +1572,7 @@ impl UdpReader {
                                                     tmp.process(&diff_bytes);
                                                     let is_alt = tmp.screen().alternate_screen();
                                                     in_alt_screen.store(is_alt, Ordering::Relaxed);
-                                                    let mut new_ack = tmp.screen().contents_formatted();
-                                                    if is_alt {
-                                                        let mut prefixed = b"\x1b[?1049h".to_vec();
-                                                        prefixed.extend_from_slice(&new_ack);
-                                                        new_ack = prefixed;
-                                                    }
-                                                    self.ack_state = new_ack;
+                                                    self.ack_state = screen_snapshot(tmp.screen());
                                                     self.ack_state_seq = diff_id;
                                                     // Resync the authoritative emulator to the new
                                                     // state so the prediction engine (and the
@@ -3982,6 +3971,43 @@ mod tests {
         assert!(
             in_alt_screen.load(Ordering::Relaxed),
             "alt-screen state must be preserved across a full-state snapshot"
+        );
+    }
+
+    /// The whole chain the paste bug ran through, in one test.
+    ///
+    /// The server snapshots a screen whose program has asked for bracketed
+    /// paste, the client rebuilds from that snapshot, and the renderer emits an
+    /// update for the user's terminal. Until `screen_snapshot` existed the
+    /// payload was `contents_formatted()` — cells only — so the mode was lost
+    /// at the first hop and the client spent the session believing it was off.
+    /// What that cost is a multi-line paste sent raw: one Enter per line.
+    #[test]
+    fn a_full_state_snapshot_carries_bracketed_paste_to_the_clients_terminal() {
+        let (mut reader, emulator, prediction, renderer, in_alt_screen) =
+            make_full_state_fixtures(DiffMode::StateSync);
+
+        // What the server puts on the wire for a prompt that wants brackets.
+        let snapshot = {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(b"$ \x1b[?2004h");
+            crate::screen_snapshot(p.screen())
+        };
+        let out =
+            reader.apply_full_state(&snapshot, &emulator, &prediction, &renderer, &in_alt_screen);
+
+        assert!(
+            emulator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .screen()
+                .bracketed_paste(),
+            "the client's emulator must learn the mode from the snapshot"
+        );
+        assert!(
+            String::from_utf8_lossy(&out).contains("\x1b[?2004h"),
+            "the mode must reach the terminal the client is driving: {:?}",
+            String::from_utf8_lossy(&out)
         );
     }
 

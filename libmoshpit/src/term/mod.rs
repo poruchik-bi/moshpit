@@ -14,6 +14,7 @@ pub use self::emulator::Emulator;
 pub use self::prediction::{DisplayPreference, OverlayCell, OverlayCursor, PredictionEngine};
 pub use self::renderer::{
     Renderer, paint_overlays_to_ansi, render_prediction_update, render_server_update,
+    screen_modes, screen_snapshot,
 };
 
 /// A message for the moshpits psuedo-terminal
