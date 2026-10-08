@@ -105,6 +105,20 @@ pub struct UdpSender {
     /// are silently drained.
     #[builder(default)]
     diff_mode: DiffMode,
+    /// Whether this sender is carrying typed input rather than screen output.
+    ///
+    /// The counterpart of [`UdpReader::carries_input`](crate::UdpReader). The
+    /// peer's reader only asks for a lost frame back if this one kept it, and
+    /// only gets it if this one answers the NAK — so the two have to be set
+    /// together. A reader that tracks gaps against a sender that drops its
+    /// retransmit buffer is worse than neither: it waits out four NAK retries
+    /// for a frame nothing can resend, and a session that loses its very first
+    /// datagram stalls past the client's own `prove_udp` deadline and falls
+    /// back to SSH.
+    ///
+    /// Set by the client, which is the side that sends what was typed.
+    #[builder(default)]
+    carries_input: bool,
 }
 
 impl UdpSender {
@@ -169,7 +183,7 @@ impl UdpSender {
                 seqs = self.retransmit_rx.recv(), if retransmit_active => {
                     match seqs {
                         Some(seqs) => {
-                            if self.diff_mode == DiffMode::Reliable {
+                            if self.carries_input || self.diff_mode == DiffMode::Reliable {
                                 let was_empty = self.pending_retransmit.is_empty();
                                 self.pending_retransmit.extend(seqs);
                                 // Arm the deadline on the first enqueue so the drain fires
@@ -202,7 +216,7 @@ impl UdpSender {
                             let seq = self.send_seq;
                             self.send_seq += 1;
                             let wire = self.encrypt(&frame, seq)?;
-                            if self.diff_mode == DiffMode::Reliable {
+                            if self.carries_input || self.diff_mode == DiffMode::Reliable {
                                 let _prev = self.retransmit_buffer.insert(seq, wire.clone());
                                 // Evict packets that fell outside the retransmit window
                                 let cutoff = seq.saturating_sub(RETRANSMIT_WINDOW);
@@ -291,6 +305,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{EncryptedFrame, UdpSender, now_micros};
+    use crate::DiffMode;
 
     fn make_sender(
         socket: Arc<UdpSocket>,
@@ -496,6 +511,59 @@ mod tests {
 
     /// A retransmit request received via `retransmit_rx` in Reliable mode arms the 20ms
     /// deadline; when it fires the frame is re-sent to the wire and the deadline is parked.
+    /// The other half of `UdpReader::carries_input`, and the half that was
+    /// missing when it shipped.
+    ///
+    /// In `StateSync` the retransmit buffer is off and NAKs are drained, which
+    /// is right for a screen. With the reader asking for lost input back and
+    /// this side unable to answer, the server waited out four NAK retries for
+    /// a frame nothing would ever resend — about three seconds — and a session
+    /// that lost its first datagram blew through the client's `prove_udp`
+    /// deadline and came up on SSH instead. The two flags have to move together.
+    #[tokio::test]
+    async fn input_is_resent_when_the_peer_asks_even_in_statesync() -> Result<()> {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let server_addr = server.local_addr()?;
+        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        send_socket.connect(server_addr).await?;
+        server.connect(send_socket.local_addr()?).await?;
+
+        let (_ctrl_tx, ctrl_rx) = channel::<EncryptedFrame>(4);
+        let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
+        let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(4);
+        let token = CancellationToken::new();
+
+        let mut sender = make_sender(send_socket, ctrl_rx, frame_rx, retransmit_rx);
+        sender.diff_mode = DiffMode::StateSync;
+        sender.carries_input = true;
+        let token2 = token.clone();
+        let handle = spawn(async move { drop(sender.frame_loop(token2).await) });
+
+        frame_tx
+            .send(EncryptedFrame::Keepalive(0))
+            .await
+            .expect("test channel send");
+        let mut buf = vec![0u8; 65535];
+        let got_original = timeout(Duration::from_millis(200), server.recv(&mut buf))
+            .await
+            .is_ok();
+
+        retransmit_tx.send(vec![0]).await.expect("test channel send");
+        let got_retransmit = timeout(Duration::from_millis(200), server.recv(&mut buf))
+            .await
+            .is_ok();
+
+        token.cancel();
+        drop(handle.await);
+
+        assert!(got_original, "original packet must reach the peer");
+        assert!(
+            got_retransmit,
+            "input was not resent in StateSync — the reader's NAK has nobody to answer it"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn retransmit_deadline_fires_after_nak_request() -> Result<()> {
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
