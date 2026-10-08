@@ -565,6 +565,10 @@ async fn handle_connection(
                 .repaint_tx(repaint_tx)
                 .nak_received_count(nak_received_count.clone())
                 .diff_mode(diff_mode)
+                // This reader carries what the user typed. A lost frame here is
+                // lost keystrokes, so it keeps the reorder buffer and the NAKs
+                // whatever mode the screen is being sent in.
+                .carries_input(true)
                 .client_ack_tx(client_ack_tx)
                 .last_rx_us(last_rx_us.clone())
                 .build();

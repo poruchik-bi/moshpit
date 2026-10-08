@@ -167,6 +167,23 @@ pub struct UdpReader {
     /// sending are all disabled — frames are delivered immediately in arrival order.
     #[builder(default)]
     diff_mode: DiffMode,
+    /// Whether this reader is carrying typed input rather than screen output.
+    ///
+    /// The fast path those two modes take is right for a screen: a diff that
+    /// goes missing is repaired by the next state sync, so waiting for it would
+    /// only stall the display. It is wrong for the other direction. The server
+    /// reads what someone typed through this same `UdpReader`, and a dropped
+    /// `Bytes` frame there is a slice of their keystrokes, skipped with no NAK
+    /// and never asked for again.
+    ///
+    /// Harmless while nothing sent more than one frame at a time. A paste sends
+    /// several back to back, and the result was a paste that arrived with
+    /// pieces missing — different pieces on every attempt.
+    ///
+    /// Set by the server. The client leaves it false and keeps the fast path
+    /// for the screen.
+    #[builder(default)]
+    carries_input: bool,
     /// Client-mode `StateSync` state: the `contents_formatted()` snapshot of the
     /// client's screen at the point the last `StateSyncDiff` was applied.
     /// Empty before any diff is applied.
@@ -587,7 +604,12 @@ impl UdpReader {
         // entirely.  Deliver the frame immediately regardless of arrival order,
         // advance next_seq past any gap, and never send NAKs or RepaintRequests.
         // ScreenState frames are still delivered through the fast path below.
-        if self.diff_mode == DiffMode::Datagram || self.diff_mode == DiffMode::StateSync {
+        //
+        // Never for input. Dropping a screen diff costs a repaint; dropping a
+        // keystroke loses it for good — see `carries_input`.
+        if !self.carries_input
+            && (self.diff_mode == DiffMode::Datagram || self.diff_mode == DiffMode::StateSync)
+        {
             self.next_seq = seq + 1;
             return self.route_or_deliver(frame).into_iter().collect();
         }
@@ -821,7 +843,9 @@ impl UdpReader {
     /// window. Returns frames from `recv_buffer` that become deliverable after skipping
     /// permanently lost packets.
     fn check_nak_timeouts(&mut self) -> Vec<EncryptedFrame> {
-        if self.diff_mode != DiffMode::Reliable {
+        // Input is recovered whatever the screen mode is: a gap here is typed
+        // characters, and nothing else will ever bring them back.
+        if !self.carries_input && self.diff_mode != DiffMode::Reliable {
             return vec![];
         }
         let now = Instant::now();
@@ -1960,12 +1984,85 @@ mod tests {
     use super::now_micros;
     use super::{
         ClientRenderCtx, DiffMode, EncryptedFrame, MAX_NAK_RETRIES, MAX_NAK_TIMEOUT, MAX_SEQ_JUMP,
-        MIN_NAK_CHECK_INTERVAL, MIN_NAK_TIMEOUT, RECV_BUFFER_REPAINT_THRESHOLD,
+        MIN_NAK_CHECK_INTERVAL, MIN_NAK_TIMEOUT, NAK_TIMEOUT, RECV_BUFFER_REPAINT_THRESHOLD,
         REPAINT_REQUEST_THRESHOLD, UdpReader, intercept_queries_core,
         process_bytes_with_prediction,
     };
     use crate::udp::sender::RETRANSMIT_WINDOW;
     use crate::{Emulator, PredictionEngine, Renderer, TerminalMessage};
+
+    /// Typed input must never be skipped, however the screen is being carried.
+    ///
+    /// The fast path below `handle_arrival` was written for screen diffs
+    /// travelling server→client, where "deliver the newest and repaint over the
+    /// gap" is right. The same `UdpReader` serves the *input* direction on the
+    /// server, where it is exactly wrong: a dropped `Bytes` frame is a slice of
+    /// what someone typed, and it is gone with no NAK and no retransmit.
+    ///
+    /// It showed up as a paste: a chunked 1439-character paste arrived with
+    /// pieces missing, and differently missing on every attempt.
+    #[tokio::test]
+    async fn input_is_not_skipped_over_a_gap_in_statesync() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let (nak_tx, mut nak_rx) = channel(8);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).expect("test key"),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
+            .diff_mode(DiffMode::StateSync)
+            .carries_input(true)
+            .nak_out_tx(nak_tx)
+            .build();
+
+        let id = crate::UuidWrapper::new(Uuid::new_v4());
+        let bytes = |s: &str| EncryptedFrame::Bytes((id, s.as_bytes().to_vec()));
+
+        // Three chunks of one paste. The middle datagram is lost.
+        let first = reader.handle_arrival(bytes("one "), 0);
+        assert_eq!(first.len(), 1, "the first chunk must be delivered at once");
+        let third = reader.handle_arrival(bytes("three"), 2);
+
+        // Nothing may be handed to the pty until the gap is resolved, and the
+        // gap has to be recorded so a NAK can ask for it.
+        assert!(
+            third.is_empty(),
+            "a later chunk was handed to the pty while an earlier one was still missing"
+        );
+        assert_eq!(reader.next_seq, 1, "the reader advanced past a lost input frame");
+        assert!(
+            reader.gap_first_seen.contains_key(&1),
+            "the lost input frame was not recorded as a gap, so nothing will ever ask for it"
+        );
+
+        // ...and something has to actually ask for it. Buffering a lost frame
+        // for ever is the same loss with extra steps.
+        sleep(NAK_TIMEOUT * 2).await;
+        let _ = reader.check_nak_timeouts();
+        let asked = nak_rx.try_recv().expect("no NAK was sent for the lost input frame");
+        assert!(
+            matches!(&asked, EncryptedFrame::Nak(seqs) if seqs.contains(&1)),
+            "the NAK did not name the missing input frame: {asked:?}"
+        );
+
+        // The retransmit arrives and both come out, in order.
+        let recovered = reader.handle_arrival(bytes("two "), 1);
+        let text: Vec<Vec<u8>> = recovered
+            .iter()
+            .filter_map(|f| match f {
+                EncryptedFrame::Bytes((_, b)) => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text,
+            vec![b"two ".to_vec(), b"three".to_vec()],
+            "the recovered chunk and the one behind it did not come out in order"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_handle_arrival_seq_jump() -> Result<()> {
