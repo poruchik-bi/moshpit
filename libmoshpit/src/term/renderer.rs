@@ -178,13 +178,6 @@ impl Renderer {
 
         // ── 2. emit the update ────────────────────────────────────────────
         let mut out: Vec<u8> = Vec::with_capacity(4096);
-        // Emit the alt-screen transition first so the terminal is in the
-        // correct buffer before the content bytes are applied.
-        if new_alt && !old_alt {
-            out.extend_from_slice(b"\x1b[?1049h");
-        } else if !new_alt && old_alt {
-            out.extend_from_slice(b"\x1b[?1049l");
-        }
 
         if self.initialized && !alt_changed {
             // Native scrollback: if the new frame is simply the displayed screen
@@ -212,6 +205,25 @@ impl Renderer {
             out.extend_from_slice(&diff);
         } else {
             // First render, post-resize/invalidate, or an alt-screen swap.
+            //
+            // It is also how a client terminal that was *rebuilt* is painted
+            // back, and that is why the modes go out here rather than only on a
+            // transition below. `term.js` disposes its xterm and constructs a
+            // new one every time the terminal screen is entered, while a warm
+            // pane keeps its writer — and so this renderer — alive; the app then
+            // asks for the repaint by resizing. The new xterm has every mode
+            // off and nothing about its birth reaches here, so the transition
+            // test saw `want == displayed` and sent nothing. A paste from that
+            // terminal was unbracketed, which is one Enter per line.
+            //
+            // Leaving the alternate screen is the one thing `screen_modes`
+            // cannot say — it names what is on — so it is emitted here. Both
+            // come before the content so the terminal is in the right buffer
+            // when the cells land.
+            if old_alt && !new_alt {
+                out.extend_from_slice(b"\x1b[?1049l");
+            }
+            out.extend_from_slice(&screen_modes(screen));
             let full = frame.screen().contents_formatted();
             self.displayed.process(&out);
             self.displayed.process(&full);
@@ -914,6 +926,41 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&again).contains("\x1b[?2004"),
             "an unchanged mode must not be re-sent on every frame"
+        );
+    }
+
+    /// A full repaint is how the app puts a *rebuilt* terminal back on screen.
+    ///
+    /// `term.js` disposes its xterm and builds a fresh one every time the
+    /// terminal screen is entered, while a warm pane keeps the writer — and
+    /// therefore this renderer — alive. The app asks for the repaint by
+    /// resizing. A brand new xterm has bracketed paste off; this renderer still
+    /// believes it is on, because nothing about the client's rebuild reaches
+    /// here. So the transition test below never fires and the mode is never
+    /// re-sent, which is a multi-line paste arriving as one Enter per line.
+    #[test]
+    fn a_forced_full_refresh_carries_the_input_modes_again() {
+        let mut r = Renderer::new(24, 80);
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"$ \x1b[?2004h");
+        let first = r.render(p.screen(), &[], None);
+        assert!(
+            String::from_utf8_lossy(&first).contains("\x1b[?2004h"),
+            "the first render must carry the mode"
+        );
+
+        // The client's terminal is rebuilt from nothing; the app resizes to
+        // force the repaint that paints it back. A fresh parser is that new
+        // xterm: all it ever sees is this one render.
+        r.set_size(24, 80);
+        let again = r.render(p.screen(), &[], None);
+        let mut rebuilt = vt100::Parser::new(24, 80, 0);
+        rebuilt.process(&again);
+        assert!(
+            rebuilt.screen().bracketed_paste(),
+            "a full refresh repaints a terminal that has lost every mode, so it \
+             has to carry them: {:?}",
+            String::from_utf8_lossy(&again)
         );
     }
 
