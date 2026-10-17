@@ -10,16 +10,52 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt,
     sync::Arc,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use libmoshpit::{EncryptedFrame, TerminalMessage};
-use tokio::sync::{Mutex, mpsc::Sender};
+use tokio::sync::{Mutex, Notify, mpsc::Sender};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Maximum bytes kept in the per-session scrollback ring buffer (64 KiB).
 pub(crate) const SCROLLBACK_CAPACITY: usize = 65_536;
+
+/// How many times the screen has changed, and a wake-up for whoever is
+/// waiting to send it. The count alone made the state-sync loop poll on a
+/// 50 ms tick, so every keystroke's echo sat out a random 0–50 ms before it
+/// left the server — measured at a 29 ms median against 0.8 ms for ssh on the
+/// same loopback.
+#[derive(Debug)]
+pub(crate) struct Dirty {
+    count: AtomicU64,
+    changed: Notify,
+}
+
+impl Dirty {
+    /// Starts at 1 so the first sync tick always sends an initial screen state.
+    pub(crate) fn new() -> Self {
+        Self {
+            count: AtomicU64::new(1),
+            changed: Notify::new(),
+        }
+    }
+
+    pub(crate) fn bump(&self) {
+        let _ = self.count.fetch_add(1, Ordering::Relaxed);
+        // `notify_one` keeps a permit when nobody is waiting yet, so a change
+        // that lands while the loop is busy sending still wakes it after.
+        self.changed.notify_one();
+    }
+
+    pub(crate) fn load(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn changed(&self) {
+        self.changed.notified().await;
+    }
+}
 
 /// Replaceable output handle for a session.
 #[derive(Debug)]
@@ -54,7 +90,7 @@ pub(crate) struct SessionRecord {
     pub server_emulator: Arc<Mutex<vt100::Parser>>,
     /// Counter tracking when the screen state has changed (e.g. PTY output or resize).
     /// Used by the screen-sync task to skip expensive re-rendering when idle.
-    pub dirty_counter: Arc<AtomicU64>,
+    pub dirty_counter: Arc<Dirty>,
     /// Set to `true` by `spawn_pty_reader` whenever a diff chunk is forwarded to the
     /// client. Atomically swapped to `false` by the screen-sync task each tick to
     /// suppress redundant snapshots while the diff stream is actively delivering content.
@@ -140,7 +176,7 @@ mod test {
         }));
         let scrollback = Arc::new(Mutex::new(VecDeque::<u8>::new()));
         let server_emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
-        let dirty_counter = Arc::new(AtomicU64::new(1));
+        let dirty_counter = Arc::new(super::Dirty::new());
         let diff_in_flight = Arc::new(AtomicBool::new(false));
         let effective_mtu = Arc::new(AtomicUsize::new(1200));
         let record = SessionRecord {

@@ -66,7 +66,7 @@ use crate::{
     cli::Cli,
     config::Config,
     session::{
-        FullSessionRegistry, SCROLLBACK_CAPACITY, SessionOutputHandle, SessionRecord,
+        Dirty, FullSessionRegistry, SCROLLBACK_CAPACITY, SessionOutputHandle, SessionRecord,
         new_full_registry,
     },
 };
@@ -121,6 +121,17 @@ const DATAGRAM_REPAINT_INTERVAL: Duration = Duration::from_millis(150);
 /// Tick interval for the state-sync task in `StateSync` mode.  Each tick computes
 /// `contents_diff(ack_state, current)` and sends the result if non-empty.
 const STATESYNC_INTERVAL: Duration = Duration::from_millis(50);
+/// How long the state-sync loop lets output settle after the screen changes
+/// before it diffs, so one redraw written in a few pieces leaves as one diff.
+/// Shorter than mosh's 8 ms `send_mindelay` on purpose: measured on loopback,
+/// the echo was 5.6 ms at 0 and 14.2 ms at 8, and a multiplexer's redraw lands
+/// well inside 2. Whatever a longer burst splits off goes out
+/// [`STATESYNC_MIN_SPACING`] later.
+const STATESYNC_COLLECT: Duration = Duration::from_millis(2);
+/// The closest two diffs ever go out, so a burst of output still coalesces
+/// instead of sending one cumulative diff per PTY read. mosh's
+/// `SEND_INTERVAL_MIN`.
+const STATESYNC_MIN_SPACING: Duration = Duration::from_millis(20);
 /// Maximum number of `(diff_id, contents_formatted)` entries kept in the server's
 /// sent-states ring buffer.  When `ClientAck(diff_id)` arrives, the server looks up
 /// this entry to advance its ack baseline.
@@ -298,7 +309,7 @@ async fn resolve_session(
     Arc<Mutex<SessionOutputHandle>>,
     Arc<Mutex<VecDeque<u8>>>,
     Arc<Mutex<vt100::Parser>>,
-    Arc<AtomicU64>,
+    Arc<Dirty>,
     Arc<AtomicBool>,
     Arc<AtomicUsize>,
 )> {
@@ -530,7 +541,12 @@ async fn handle_connection(
                     // fails, and the server reports the pool as exhausted while
                     // most of it is free. So prove it is bindable first.
                     for attempt in 0..40u32 {
-                        match tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, released)).await {
+                        match tokio::net::UdpSocket::bind((
+                            std::net::Ipv4Addr::UNSPECIFIED,
+                            released,
+                        ))
+                        .await
+                        {
                             Ok(probe) => {
                                 drop(probe);
                                 let mut pool = release_pool.lock().await;
@@ -539,10 +555,12 @@ async fn handle_connection(
                                 return;
                             }
                             // `sleep` in this module is the blocking one; this task must not.
-                            Err(_) => tokio::time::sleep(Duration::from_millis(
-                                100 * u64::from(attempt.min(5) + 1),
-                            ))
-                            .await,
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_millis(
+                                    100 * u64::from(attempt.min(5) + 1),
+                                ))
+                                .await
+                            }
                         }
                     }
                     warn!("UDP port {released} never came free; leaving it out of the pool");
@@ -655,8 +673,9 @@ async fn handle_connection(
             // no new output to format this tick.  Mirrors the `screen_sync` loop and
             // avoids the per-tick `contents_formatted()` while idle.
             let mut last_dirty: u64 = 0;
+            let mut last_send = tokio::time::Instant::now();
             loop {
-                select! {
+                let sync = select! {
                     () = ss_token.cancelled() => break,
                     msg = repaint_rx.recv() => {
                         if msg.is_none() {
@@ -682,102 +701,130 @@ async fn handle_connection(
                         ack_diff_id = 0;
                         sent_states.clear();
                         ack_dirty = true;
+                        false
                     }
                     diff_id = client_ack_rx.recv() => {
                         let Some(diff_id) = diff_id else { break; };
                         if apply_client_ack(&mut sent_states, &mut ack_state, &mut ack_diff_id, diff_id) {
                             ack_dirty = true;
                         }
+                        false
                     }
-                    _ = ticker.tick() => {
-                        // Cheap short-circuit before locking the emulator and formatting
-                        // the whole screen: when the PTY produced no output since the last
-                        // tick, the client is fully caught up, and the ack baseline is
-                        // clean, there is nothing to do.
-                        let now_dirty = ss_dirty.load(Ordering::Relaxed);
-                        if now_dirty == last_dirty && !ack_dirty && ack_diff_id == diff_counter {
-                            continue;
-                        }
-                        let (current, rows, cols, is_alt, is_bracketed) = {
-                            let emu = ss_emu.lock().await;
-                            let screen = emu.screen();
-                            let snapshot = screen_snapshot(screen);
-                            let (r, c) = screen.size();
-                            (snapshot, r, c, screen.alternate_screen(), screen.bracketed_paste())
-                        };
-                        // Skip expensive parser work when client is fully caught up and
-                        // the screen hasn't changed since the last tick.
-                        if current == last_current && !ack_dirty && ack_diff_id == diff_counter {
-                            continue;
-                        }
-                        // Clone for cache update; used after `current` may be moved below.
-                        let current_for_cache = current.clone();
-                        let mut ack_parser = vt100::Parser::new(rows, cols, 0);
-                        if !ack_state.is_empty() {
-                            // ack_state may be prefixed with \033[?1049h — process as-is so the
-                            // parser reconstructs the correct screen mode before diffing.
-                            ack_parser.process(&ack_state);
-                        }
-                        let ack_is_alt = ack_parser.screen().alternate_screen();
-                        let ack_is_bracketed = ack_parser.screen().bracketed_paste();
-                        let mut cur_parser = vt100::Parser::new(rows, cols, 0);
-                        cur_parser.process(&current);
-                        let mut diff = Vec::new();
-                        if is_alt && !ack_is_alt {
-                            diff.extend_from_slice(b"\x1b[?1049h");
-                        } else if !is_alt && ack_is_alt {
-                            diff.extend_from_slice(b"\x1b[?1049l");
-                        }
-                        // `contents_diff` is cells, so a mode that flipped with
-                        // nothing else changing produces an empty diff and the
-                        // client never hears about it. Bracketed paste is the
-                        // one it decides from: a prompt turning it on is often
-                        // the only thing that happened this tick.
-                        if is_bracketed && !ack_is_bracketed {
-                            diff.extend_from_slice(b"\x1b[?2004h");
-                        } else if !is_bracketed && ack_is_bracketed {
-                            diff.extend_from_slice(b"\x1b[?2004l");
-                        }
-                        let content_diff = cur_parser.screen().contents_diff(ack_parser.screen());
-                        if content_diff.is_empty() && diff.is_empty() {
-                            last_current = current_for_cache;
-                            last_dirty = now_dirty;
-                            ack_dirty = false;
-                            continue;
-                        }
-                        diff.extend_from_slice(&content_diff);
-                        let compressed = encode_all(diff.as_slice(), 1)
-                            .unwrap_or_else(|_| diff.clone());
-                        if compressed.len() > MAX_STATESYNC_DIFF_BYTES {
-                            // Diff too large for a single UDP datagram (e.g., full alt-screen
-                            // repaint from htop over NAT).  Fall back to a chunked full-state push
-                            // so fragmented/dropped packets cannot stall the ack pipeline.
-                            let full_compressed = encode_all(current.as_slice(), 3)
-                                .unwrap_or_else(|_| current.clone());
-                            if !send_state_chunked(&ss_tx, full_compressed).await {
-                                break;
-                            }
-                            ack_state = current;
-                            ack_diff_id = 0;
-                            sent_states.clear();
-                        } else {
-                            diff_counter += 1;
-                            if ss_tx
-                                .send(EncryptedFrame::StateSyncDiff((ack_diff_id, diff_counter, compressed)))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            sent_states.push_back((diff_counter, current));
-                            if sent_states.len() > STATESYNC_HISTORY_LEN {
-                                drop(sent_states.pop_front());
-                            }
-                        }
+                    // The screen changed: send soon rather than at the next tick,
+                    // which is the difference between an echo the hand feels and
+                    // one it does not. The tick below stays as the fallback for
+                    // acks and anything a wake-up missed.
+                    () = ss_dirty.changed() => {
+                        let settle = (tokio::time::Instant::now() + STATESYNC_COLLECT)
+                            .max(last_send + STATESYNC_MIN_SPACING);
+                        tokio::time::sleep_until(settle).await;
+                        ticker.reset();
+                        true
+                    }
+                    _ = ticker.tick() => true,
+                };
+                if !sync {
+                    continue;
+                }
+                {
+                    // Cheap short-circuit before locking the emulator and formatting
+                    // the whole screen: when the PTY produced no output since the last
+                    // tick, the client is fully caught up, and the ack baseline is
+                    // clean, there is nothing to do.
+                    let now_dirty = ss_dirty.load();
+                    if now_dirty == last_dirty && !ack_dirty && ack_diff_id == diff_counter {
+                        continue;
+                    }
+                    let (current, rows, cols, is_alt, is_bracketed) = {
+                        let emu = ss_emu.lock().await;
+                        let screen = emu.screen();
+                        let snapshot = screen_snapshot(screen);
+                        let (r, c) = screen.size();
+                        (
+                            snapshot,
+                            r,
+                            c,
+                            screen.alternate_screen(),
+                            screen.bracketed_paste(),
+                        )
+                    };
+                    // Skip expensive parser work when client is fully caught up and
+                    // the screen hasn't changed since the last tick.
+                    if current == last_current && !ack_dirty && ack_diff_id == diff_counter {
+                        continue;
+                    }
+                    // Clone for cache update; used after `current` may be moved below.
+                    let current_for_cache = current.clone();
+                    let mut ack_parser = vt100::Parser::new(rows, cols, 0);
+                    if !ack_state.is_empty() {
+                        // ack_state may be prefixed with \033[?1049h — process as-is so the
+                        // parser reconstructs the correct screen mode before diffing.
+                        ack_parser.process(&ack_state);
+                    }
+                    let ack_is_alt = ack_parser.screen().alternate_screen();
+                    let ack_is_bracketed = ack_parser.screen().bracketed_paste();
+                    let mut cur_parser = vt100::Parser::new(rows, cols, 0);
+                    cur_parser.process(&current);
+                    let mut diff = Vec::new();
+                    if is_alt && !ack_is_alt {
+                        diff.extend_from_slice(b"\x1b[?1049h");
+                    } else if !is_alt && ack_is_alt {
+                        diff.extend_from_slice(b"\x1b[?1049l");
+                    }
+                    // `contents_diff` is cells, so a mode that flipped with
+                    // nothing else changing produces an empty diff and the
+                    // client never hears about it. Bracketed paste is the
+                    // one it decides from: a prompt turning it on is often
+                    // the only thing that happened this tick.
+                    if is_bracketed && !ack_is_bracketed {
+                        diff.extend_from_slice(b"\x1b[?2004h");
+                    } else if !is_bracketed && ack_is_bracketed {
+                        diff.extend_from_slice(b"\x1b[?2004l");
+                    }
+                    let content_diff = cur_parser.screen().contents_diff(ack_parser.screen());
+                    if content_diff.is_empty() && diff.is_empty() {
                         last_current = current_for_cache;
                         last_dirty = now_dirty;
                         ack_dirty = false;
+                        continue;
                     }
+                    diff.extend_from_slice(&content_diff);
+                    let compressed =
+                        encode_all(diff.as_slice(), 1).unwrap_or_else(|_| diff.clone());
+                    last_send = tokio::time::Instant::now();
+                    if compressed.len() > MAX_STATESYNC_DIFF_BYTES {
+                        // Diff too large for a single UDP datagram (e.g., full alt-screen
+                        // repaint from htop over NAT).  Fall back to a chunked full-state push
+                        // so fragmented/dropped packets cannot stall the ack pipeline.
+                        let full_compressed =
+                            encode_all(current.as_slice(), 3).unwrap_or_else(|_| current.clone());
+                        if !send_state_chunked(&ss_tx, full_compressed).await {
+                            break;
+                        }
+                        ack_state = current;
+                        ack_diff_id = 0;
+                        sent_states.clear();
+                    } else {
+                        diff_counter += 1;
+                        if ss_tx
+                            .send(EncryptedFrame::StateSyncDiff((
+                                ack_diff_id,
+                                diff_counter,
+                                compressed,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        sent_states.push_back((diff_counter, current));
+                        if sent_states.len() > STATESYNC_HISTORY_LEN {
+                            drop(sent_states.pop_front());
+                        }
+                    }
+                    last_current = current_for_cache;
+                    last_dirty = now_dirty;
+                    ack_dirty = false;
                 }
             }
         });
@@ -799,7 +846,7 @@ async fn handle_connection(
                 select! {
                     () = sync_token.cancelled() => break,
                     () = tokio::time::sleep(interval) => {
-                        let current = sync_dirty.load(Ordering::Relaxed);
+                        let current = sync_dirty.load();
                         let delta = current.wrapping_sub(last_dirty);
                         if delta == 0 {
                             // No PTY output since last tick — double the sleep up to the
@@ -1216,7 +1263,7 @@ async fn new_session(
     Arc<Mutex<SessionOutputHandle>>,
     Arc<Mutex<VecDeque<u8>>>,
     Arc<Mutex<vt100::Parser>>,
-    Arc<AtomicU64>,
+    Arc<Dirty>,
     Arc<AtomicBool>,
     Arc<AtomicUsize>,
 )> {
@@ -1230,8 +1277,7 @@ async fn new_session(
     }));
     let scrollback = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
     let server_emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
-    // Start at 1 so the first sync tick always sends an initial screen state.
-    let dirty_counter = Arc::new(AtomicU64::new(1));
+    let dirty_counter = Arc::new(Dirty::new());
     let diff_in_flight = Arc::new(AtomicBool::new(false));
     let effective_mtu = Arc::new(AtomicUsize::new(MAX_UDP_PAYLOAD));
 
@@ -1324,7 +1370,7 @@ fn spawn_pty_reader(
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
-    dirty_counter: Arc<AtomicU64>,
+    dirty_counter: Arc<Dirty>,
     diff_in_flight: Arc<AtomicBool>,
     pacing_delay: Duration,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
@@ -1357,7 +1403,7 @@ fn spawn_pty_reader(
                     }
 
                     server_emulator.blocking_lock().process(buf_slice);
-                    let _ = dirty_counter.fetch_add(1, Ordering::Relaxed);
+                    dirty_counter.bump();
 
                     let send_ok = {
                         let h = output_handle.blocking_lock();
@@ -1497,7 +1543,7 @@ fn spawn_pty(
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
-    dirty_counter: Arc<AtomicU64>,
+    dirty_counter: Arc<Dirty>,
     diff_in_flight: Arc<AtomicBool>,
     pacing_delay: Duration,
     #[cfg_attr(not(unix), allow(unused_variables))] term_type: String,
@@ -1902,7 +1948,7 @@ fn spawn_pty(
                         .screen_mut()
                         .set_size(rows, columns);
                     // Resize changes the rendered screen layout — mark dirty.
-                    let _ = dirty_counter.fetch_add(1, Ordering::Relaxed);
+                    dirty_counter.bump();
                 }
                 TerminalMessage::Input(data) => {
                     if let Err(e) = term_in.write_all(&data) {
