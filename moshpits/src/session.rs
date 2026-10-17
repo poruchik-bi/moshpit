@@ -125,7 +125,7 @@ mod test {
     use std::{
         collections::VecDeque,
         sync::Arc,
-        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize},
+        sync::atomic::{AtomicBool, AtomicUsize},
     };
 
     use libmoshpit::{EncryptedFrame, TerminalMessage};
